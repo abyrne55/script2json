@@ -1,5 +1,7 @@
 package main
 
+// Generated-By: Gemini 2.5 Pro
+
 import (
 	"bufio"
 	"bytes"
@@ -73,14 +75,30 @@ func processBuffer(buffer *bytes.Buffer, state *State, cmd *RawCommand, output *
 		// Find the next prompt in the buffer.
 		promptPos, _ := findPrompt(buffer.Bytes())
 		if promptPos == -1 {
-			// No prompt found, so everything in the buffer is output.
-			output.Write(buffer.Bytes())
-			buffer.Reset()
-			return true // We processed the whole buffer.
+			// No prompt found. We can't be sure if the command's output is complete,
+			// so we just wait for more data.
+			return false
 		}
 
-		// A prompt was found. Everything before it belongs to the previous command's output.
-		output.Write(buffer.Bytes()[:promptPos])
+		// A prompt was found. The real output for the previous command is everything
+		// up to the line the prompt is on.
+		promptLineStartPos := bytes.LastIndex(buffer.Bytes()[:promptPos], []byte("\n"))
+
+		var outputBytes []byte
+		var remainingBytes []byte
+
+		if promptLineStartPos != -1 {
+			// Output is everything up to and including the newline.
+			outputBytes = buffer.Bytes()[:promptLineStartPos+1]
+			remainingBytes = buffer.Bytes()[promptLineStartPos+1:]
+		} else {
+			// Prompt is on the first line in the buffer. This means there's no output
+			// from a previous command in this chunk to be processed.
+			outputBytes = []byte{}
+			remainingBytes = buffer.Bytes()
+		}
+
+		output.Write(outputBytes)
 
 		// Now, emit the completed record for the *previous* command.
 		if cmd.raw != "" {
@@ -88,8 +106,10 @@ func processBuffer(buffer *bytes.Buffer, state *State, cmd *RawCommand, output *
 			*id++
 		}
 
-		// The new state is to parse the command that starts with the prompt we just found.
-		buffer.Next(promptPos) // Consume the output part from the buffer.
+		// The buffer now contains the prompt line and whatever came after.
+		buffer.Reset()
+		buffer.Write(remainingBytes)
+
 		*state = ParsingCommand
 		output.Reset()
 		return true // State changed, so we made progress.
