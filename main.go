@@ -68,35 +68,70 @@ func extractCommand(line string) string {
 	result := ""
 	i := 0
 	for i < len(commandPart) {
-		if i+2 < len(commandPart) && commandPart[i:i+2] == "[K" {
-			// [K erases from cursor to end of line, so we truncate result
-			result = ""
-			i += 2
-		} else if i+1 < len(commandPart) && commandPart[i] == '\x08' {
-			// Backspace - remove last character
+		if i < len(commandPart) && commandPart[i] == '\x1b' {
+			// Handle ANSI escape sequences
+			j := i + 1
+			if j < len(commandPart) {
+				if commandPart[j] == '[' {
+					// CSI sequence: ESC [
+					j++
+					// Skip parameters (digits, semicolons, question marks)
+					for j < len(commandPart) && (commandPart[j] >= '0' && commandPart[j] <= '9' ||
+						commandPart[j] == ';' || commandPart[j] == '?' || commandPart[j] == '=' ||
+						commandPart[j] == '<' || commandPart[j] == '>') {
+						j++
+					}
+					// Check for specific commands
+					if j < len(commandPart) {
+						cmd := commandPart[j]
+						if cmd == 'K' {
+							// Erase to end of line - clear result
+							result = ""
+						} else if cmd == 'P' {
+							// Delete character - remove last character
+							if len(result) > 0 {
+								result = result[:len(result)-1]
+							}
+						} else if cmd == 'D' {
+							// Cursor left - could be used for editing, treat as backspace
+							if len(result) > 0 {
+								result = result[:len(result)-1]
+							}
+						}
+						j++ // Skip the command letter
+					}
+				} else if commandPart[j] == ']' {
+					// OSC sequence: ESC ]
+					j++
+					// Skip until BEL (0x07) or ESC \
+					for j < len(commandPart) && commandPart[j] != '\x07' {
+						if commandPart[j] == '\x1b' && j+1 < len(commandPart) && commandPart[j+1] == '\\' {
+							j += 2
+							break
+						}
+						j++
+					}
+					if j < len(commandPart) && commandPart[j] == '\x07' {
+						j++ // Skip BEL
+					}
+				} else {
+					// Other escape sequences, skip next character
+					j++
+				}
+			}
+			i = j
+		} else if i+1 < len(commandPart) && (commandPart[i] == '\x08' || commandPart[i] == '\x7f') {
+			// Backspace or DEL - remove last character
 			if len(result) > 0 {
 				result = result[:len(result)-1]
 			}
 			i++
-		} else if commandPart[i] == '\x1b' {
-			// Skip ANSI escape sequences
-			j := i + 1
-			if j < len(commandPart) && commandPart[j] == '[' {
-				j++
-				for j < len(commandPart) && (commandPart[j] >= '0' && commandPart[j] <= '9' || commandPart[j] == ';' || commandPart[j] == '?') {
-					j++
-				}
-				if j < len(commandPart) {
-					j++ // Skip the final letter
-				}
-			}
-			i = j
 		} else if commandPart[i] >= 32 && commandPart[i] <= 126 {
 			// Regular printable character
 			result += string(commandPart[i])
 			i++
 		} else {
-			// Skip other control characters
+			// Skip all other control characters (0x00-0x1F except handled ones)
 			i++
 		}
 	}
