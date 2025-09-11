@@ -29,7 +29,7 @@ const (
 	ParsingCommand
 )
 
-var promptPatterns = [][]byte{[]byte("$ "), []byte("# "), []byte("> ")}
+var promptPatterns = [][]byte{[]byte("$ "), []byte("> ")}
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
