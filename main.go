@@ -1,277 +1,236 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strings"
+
+	"github.com/acarl005/stripansi"
 )
 
-// CommandOutput represents a single command and its output in JSONL format
-type CommandOutput struct {
+type Record struct {
 	ID      string `json:"id"`
 	Command string `json:"command"`
 	Output  string `json:"output"`
 }
 
-// ANSI escape sequence patterns
-var (
-	// Remove ANSI escape sequences (colors, cursor movements, etc.)
-	ansiRegex = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
-	// Remove [K sequences (erase line)
-	eraseRegex = regexp.MustCompile(`\[K`)
-	// Remove backspace sequences
-	backspaceRegex = regexp.MustCompile(`.\x08`)
-	// Remove control sequences like ]0; (window title changes)
-	controlRegex = regexp.MustCompile(`\][0-9]+;[^\x07\x1b]*[\x07\x1b]`)
-	// Remove other control characters including carriage returns
-	otherControlRegex = regexp.MustCompile(`[\x00-\x08\x0b-\x1f\x7f]`)
-	// Pattern to match shell prompt with ANSI sequences
-	promptRegex = regexp.MustCompile(`\[[^]]*\][^$]*\$ `)
-	// Pattern for control sequences that start with [?
-	bracketControlRegex = regexp.MustCompile(`\[\?[0-9]+[hl]`)
+type State int
+
+const (
+	// State to accumulate output until we find the next prompt.
+	AccumulatingOutput State = iota
+	// State when we have found a prompt and are waiting for the command to be terminated by a newline.
+	ParsingCommand
 )
 
-// cleanText removes ANSI escape sequences and control characters
-func cleanText(text string) string {
-	// Remove ANSI escape sequences
-	text = ansiRegex.ReplaceAllString(text, "")
-	// Remove bracket control sequences
-	text = bracketControlRegex.ReplaceAllString(text, "")
-	// Remove erase sequences
-	text = eraseRegex.ReplaceAllString(text, "")
-	// Remove control sequences
-	text = controlRegex.ReplaceAllString(text, "")
-	// Remove other control characters except newlines and tabs
-	text = otherControlRegex.ReplaceAllString(text, "")
-	// Handle backspace sequences (remove character + backspace)
-	for backspaceRegex.MatchString(text) {
-		text = backspaceRegex.ReplaceAllString(text, "")
-	}
-	return text
-}
-
-// extractCommand extracts the command from a shell prompt line
-func extractCommand(line string) string {
-	// First, find the $ prompt marker
-	dollarIndex := strings.LastIndex(line, "$ ")
-	if dollarIndex == -1 {
-		return ""
-	}
-
-	// Extract everything after the $ prompt
-	commandPart := line[dollarIndex+2:]
-
-	// Now simulate the command line editing by processing control sequences
-	result := ""
-	i := 0
-	for i < len(commandPart) {
-		if i < len(commandPart) && commandPart[i] == '\x1b' {
-			// Handle ANSI escape sequences
-			j := i + 1
-			if j < len(commandPart) {
-				if commandPart[j] == '[' {
-					// CSI sequence: ESC [
-					j++
-					// Skip parameters (digits, semicolons, question marks)
-					for j < len(commandPart) && (commandPart[j] >= '0' && commandPart[j] <= '9' ||
-						commandPart[j] == ';' || commandPart[j] == '?' || commandPart[j] == '=' ||
-						commandPart[j] == '<' || commandPart[j] == '>') {
-						j++
-					}
-					// Check for specific commands
-					if j < len(commandPart) {
-						cmd := commandPart[j]
-						if cmd == 'K' {
-							// Erase to end of line - clear result
-							result = ""
-						} else if cmd == 'P' {
-							// Delete character - remove last character
-							if len(result) > 0 {
-								result = result[:len(result)-1]
-							}
-						} else if cmd == 'D' {
-							// Cursor left - could be used for editing, treat as backspace
-							if len(result) > 0 {
-								result = result[:len(result)-1]
-							}
-						}
-						j++ // Skip the command letter
-					}
-				} else if commandPart[j] == ']' {
-					// OSC sequence: ESC ]
-					j++
-					// Skip until BEL (0x07) or ESC \
-					for j < len(commandPart) && commandPart[j] != '\x07' {
-						if commandPart[j] == '\x1b' && j+1 < len(commandPart) && commandPart[j+1] == '\\' {
-							j += 2
-							break
-						}
-						j++
-					}
-					if j < len(commandPart) && commandPart[j] == '\x07' {
-						j++ // Skip BEL
-					}
-				} else {
-					// Other escape sequences, skip next character
-					j++
-				}
-			}
-			i = j
-		} else if i+1 < len(commandPart) && (commandPart[i] == '\x08' || commandPart[i] == '\x7f') {
-			// Backspace or DEL - remove last character
-			if len(result) > 0 {
-				result = result[:len(result)-1]
-			}
-			i++
-		} else if commandPart[i] >= 32 && commandPart[i] <= 126 {
-			// Regular printable character
-			result += string(commandPart[i])
-			i++
-		} else {
-			// Skip all other control characters (0x00-0x1F except handled ones)
-			i++
-		}
-	}
-
-	return strings.TrimSpace(result)
-}
-
-// isScriptHeader checks if a line is the script start/end header
-func isScriptHeader(line string) bool {
-	cleaned := cleanText(line)
-	return strings.Contains(cleaned, "Script started on") ||
-		strings.Contains(cleaned, "Script done on")
-}
-
-// isPromptLine checks if a line contains a shell prompt
-func isPromptLine(line string) bool {
-	cleaned := cleanText(line)
-	// Look for typical shell prompt patterns
-	return strings.Contains(cleaned, "$ ") && len(strings.TrimSpace(cleaned)) > 2
-}
-
-// isControlSequenceLine checks if a line is just control sequences
-func isControlSequenceLine(line string) bool {
-	cleaned := cleanText(line)
-	return strings.TrimSpace(cleaned) == ""
-}
-
-// isExitCommand checks if the line contains just "exit"
-func isExitCommand(line string) bool {
-	cleaned := strings.TrimSpace(cleanText(line))
-	return cleaned == "exit"
-}
-
-func processLine(line string, commandID *int, currentCommand *string, outputLines *[]string, inCommand *bool) {
-	// Skip script headers
-	if isScriptHeader(line) {
-		return
-	}
-
-	// Skip exit command
-	if isExitCommand(line) {
-		return
-	}
-
-	// Skip pure control sequence lines
-	if isControlSequenceLine(line) {
-		return
-	}
-
-	// Check if this is a prompt line with a command
-	if isPromptLine(line) {
-		// If we were processing a previous command, output it
-		if *inCommand && *currentCommand != "" {
-			output := strings.TrimSpace(strings.Join(*outputLines, "\n"))
-
-			cmdOutput := CommandOutput{
-				ID:      fmt.Sprintf("%d", *commandID),
-				Command: *currentCommand,
-				Output:  output,
-			}
-
-			jsonBytes, _ := json.Marshal(cmdOutput)
-			fmt.Println(string(jsonBytes))
-			os.Stdout.Sync() // Force flush
-			(*commandID)++
-		}
-
-		// Start new command
-		command := extractCommand(line)
-		if command != "" && command != "exit" {
-			*currentCommand = command
-			*outputLines = []string{}
-			*inCommand = true
-		} else {
-			*inCommand = false
-		}
-		return
-	}
-
-	// If we're in a command and this isn't a control sequence line, collect output
-	if *inCommand {
-		cleaned := cleanText(line)
-		// Skip lines that are just control sequences
-		if strings.TrimSpace(cleaned) != "" {
-			*outputLines = append(*outputLines, strings.TrimSpace(cleaned))
-		}
-	}
-}
+var promptPatterns = [][]byte{[]byte("$ "), []byte("# "), []byte("> ")}
 
 func main() {
-	commandID := 1
-	var currentCommand string
-	var outputLines []string
-	inCommand := false
+	reader := bufio.NewReader(os.Stdin)
+	id := 1
+	state := AccumulatingOutput // Start by accumulating any initial output/headers.
+	var currentCommand RawCommand
+	var currentOutput bytes.Buffer
+	var buffer bytes.Buffer
 
-	buffer := make([]byte, 1)
-	lineBuffer := ""
+	p := make([]byte, 4096)
 
 	for {
-		n, err := os.Stdin.Read(buffer)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			continue
-		}
-
+		n, err := reader.Read(p)
 		if n > 0 {
-			char := buffer[0]
+			buffer.Write(p[:n])
+		}
 
-			if char == '\n' || char == '\r' {
-				// Process complete line
-				if len(lineBuffer) > 0 {
-					processLine(lineBuffer, &commandID, &currentCommand, &outputLines, &inCommand)
-					lineBuffer = ""
-				}
+		// Process the buffer as many times as possible.
+		for processBuffer(&buffer, &state, &currentCommand, &currentOutput, &id) {
+		}
+
+		if err == io.EOF {
+			if currentCommand.raw != "" {
+				currentOutput.Write(buffer.Bytes())
+				emitRecord(id, currentCommand, currentOutput.Bytes())
+			}
+			break
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading from stdin: %v\n", err)
+			break
+		}
+	}
+}
+
+// processBuffer attempts to process a chunk of data from the buffer.
+// It returns true if it made progress, false if it needs more data.
+func processBuffer(buffer *bytes.Buffer, state *State, cmd *RawCommand, output *bytes.Buffer, id *int) bool {
+	if buffer.Len() == 0 {
+		return false
+	}
+
+	if *state == AccumulatingOutput {
+		// Find the next prompt in the buffer.
+		promptPos, _ := findPrompt(buffer.Bytes())
+		if promptPos == -1 {
+			// No prompt found, so everything in the buffer is output.
+			output.Write(buffer.Bytes())
+			buffer.Reset()
+			return true // We processed the whole buffer.
+		}
+
+		// A prompt was found. Everything before it belongs to the previous command's output.
+		output.Write(buffer.Bytes()[:promptPos])
+
+		// Now, emit the completed record for the *previous* command.
+		if cmd.raw != "" {
+			emitRecord(*id, *cmd, output.Bytes())
+			*id++
+		}
+
+		// The new state is to parse the command that starts with the prompt we just found.
+		buffer.Next(promptPos) // Consume the output part from the buffer.
+		*state = ParsingCommand
+		output.Reset()
+		return true // State changed, so we made progress.
+	}
+
+	if *state == ParsingCommand {
+		// The buffer now starts with a prompt. Find the end of the command line.
+		newlinePos := bytes.IndexAny(buffer.Bytes(), "\r\n")
+		if newlinePos == -1 {
+			return false // Need more data to find the end of the command.
+		}
+
+		// We have a full command line.
+		promptAndCmdBytes := buffer.Bytes()[:newlinePos]
+
+		// Extract the raw command text after the prompt.
+		promptPos, promptLen := findPrompt(promptAndCmdBytes)
+		if promptPos != -1 {
+			commandStart := promptPos + promptLen
+			if commandStart <= len(promptAndCmdBytes) {
+				*cmd = NewRawCommand(string(promptAndCmdBytes[commandStart:]))
 			} else {
-				// Add character to buffer
-				lineBuffer += string(char)
+				*cmd = NewRawCommand("")
+			}
+		} else {
+			// Fallback: This should not happen if the logic is correct.
+			*cmd = NewRawCommand(string(promptAndCmdBytes))
+		}
+
+		// Consume the prompt and command from the buffer.
+		buffer.Next(newlinePos)
+		if bytes.HasPrefix(buffer.Bytes(), []byte("\r\n")) {
+			buffer.Next(2)
+		} else {
+			buffer.Next(1)
+		}
+
+		// The new state is to accumulate output for this new command.
+		*state = AccumulatingOutput
+		return true // State changed, made progress.
+	}
+
+	return false
+}
+
+// findPrompt searches for a prompt in a byte slice. It's complex because of ANSI codes.
+// It returns the starting position of the prompt and the length of the prompt marker itself.
+func findPrompt(data []byte) (pos int, length int) {
+	for i := len(data) - 1; i >= 0; i-- {
+		for _, p := range promptPatterns {
+			if bytes.HasPrefix(data[i:], p) {
+				return i, len(p)
 			}
 		}
 	}
+	return -1, 0
+}
 
-	// Process any remaining line
-	if len(lineBuffer) > 0 {
-		processLine(lineBuffer, &commandID, &currentCommand, &outputLines, &inCommand)
+func emitRecord(id int, command RawCommand, output []byte) {
+	renderedCommand := command.Render()
+	if renderedCommand == "" || renderedCommand == "exit" {
+		return
 	}
 
-	// Process any remaining command
-	if inCommand && currentCommand != "" {
-		output := strings.TrimSpace(strings.Join(outputLines, "\n"))
+	record := Record{
+		ID:      fmt.Sprintf("%d", id),
+		Command: renderedCommand,
+		Output:  strings.TrimSpace(stripansi.Strip(string(output))),
+	}
 
-		cmdOutput := CommandOutput{
-			ID:      fmt.Sprintf("%d", commandID),
-			Command: currentCommand,
-			Output:  output,
+	encoder := json.NewEncoder(os.Stdout)
+	if err := encoder.Encode(record); err != nil {
+		fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+	}
+}
+
+// RawCommand holds the raw command string and can render it
+type RawCommand struct {
+	raw string
+}
+
+func NewRawCommand(raw string) RawCommand {
+	return RawCommand{raw: raw}
+}
+
+func (rc RawCommand) Render() string {
+	var runes []rune
+	cursor := 0
+	rawRunes := []rune(rc.raw)
+
+	i := 0
+	for i < len(rawRunes) {
+		r := rawRunes[i]
+		switch r {
+		case '\b', '\x7f': // backspace or delete
+			if cursor > 0 {
+				if cursor <= len(runes) {
+					runes = append(runes[:cursor-1], runes[cursor:]...)
+				}
+				cursor--
+			}
+		case '\x1b': // ANSI escape sequence
+			i++
+			if i < len(rawRunes) && rawRunes[i] == '[' {
+				i++
+				start := i
+				for i < len(rawRunes) && !((rawRunes[i] >= 'a' && rawRunes[i] <= 'z') || (rawRunes[i] >= 'A' && rawRunes[i] <= 'Z')) {
+					i++
+				}
+				if i < len(rawRunes) {
+					cmd := rawRunes[i]
+					switch cmd {
+					case 'C':
+						if cursor < len(runes) {
+							cursor++
+						}
+					case 'D':
+						if cursor > 0 {
+							cursor--
+						}
+					case 'K':
+						if cursor < len(runes) {
+							runes = runes[:cursor]
+						}
+					}
+				} else {
+					i = start
+				}
+			}
+		default:
+			if r >= 32 { // Printable characters
+				if cursor == len(runes) {
+					runes = append(runes, r)
+				} else {
+					runes = append(runes[:cursor], append([]rune{r}, runes[cursor:]...)...)
+				}
+				cursor++
+			}
 		}
-
-		jsonBytes, _ := json.Marshal(cmdOutput)
-		fmt.Println(string(jsonBytes))
-		os.Stdout.Sync() // Force flush
+		i++
 	}
+
+	return strings.TrimSpace(string(runes))
 }
