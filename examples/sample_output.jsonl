@@ -1,0 +1,4 @@
+{"id":"1","command":"echo hello","output":"hello"}
+{"id":"2","command":"echo world","output":"world"}
+{"id":"3","command":"man man | head 3","output":"head: cannot open '3' for reading: No such file or directory\nman: can't resolve man7/groff_man.7\n(command exited with status 1)"}
+{"id":"4","command":"man man | head -n4","output":"man: can't resolve man7/groff_man.7\nMAN(1)                                     Manual pager utils                                    MAN(1)\n\nNAME\n       man - an interface to the system reference manuals"}

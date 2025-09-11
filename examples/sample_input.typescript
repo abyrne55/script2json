@@ -1,0 +1,18 @@
+Script started on 2025-09-11 14:05:33-04:00 [TERM="xterm-256color" TTY="/dev/pts/18" COLUMNS="194" LINES="25"]
+]0;abyrne@abyrne-thinkpadt14sgen1:~/src/script2json/examples[?2004h[95mabyrne[m:[35m~/src/script2json/examples[m [0m[m$ echo hello
+[?2004lhello
+]0;abyrne@abyrne-thinkpadt14sgen1:~/src/script2json/examples[?2004h[95mabyrne[m:[35m~/src/script2json/examples[m [0m[m$ echo world
+[?2004lworld
+]0;abyrne@abyrne-thinkpadt14sgen1:~/src/script2json/examples[?2004h[95mabyrne[m:[35m~/src/script2json/examples[m [0m[m$ man man | head 3
+[?2004lhead: cannot open '3' for reading: No such file or directory
+man: can't resolve man7/groff_man.7
+]0;abyrne@abyrne-thinkpadt14sgen1:~/src/script2json/examples[?2004h[95mabyrne[m:[35m~/src/script2json/examples[m [0m[m$ man man[K[K[Kman[K[K[Kfam[Kn[K[K[Kman | head -n4
+[?2004lman: can't resolve man7/groff_man.7
+MAN(1)                                                                                  Manual pager utils                                                                                 MAN(1)
+
+NAME
+       man - an interface to the system reference manuals
+]0;abyrne@abyrne-thinkpadt14sgen1:~/src/script2json/examples[?2004h[95mabyrne[m:[35m~/src/script2json/examples[m [0m[m$ [?2004l
+exit
+
+Script done on 2025-09-11 14:06:10-04:00 [COMMAND_EXIT_CODE="0"]
