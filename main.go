@@ -110,6 +110,17 @@ func lineEditor(x <-chan byte, y chan<- string) {
 	inCSI := false
 	inAlternateScreen := false
 
+	insertByte := func(b byte) {
+		if cursor == len(buffer) {
+			buffer = append(buffer, b)
+		} else {
+			buffer = append(buffer, 0)
+			copy(buffer[cursor+1:], buffer[cursor:])
+			buffer[cursor] = b
+		}
+		cursor++
+	}
+
 	for b := range x {
 		if inCSI {
 			csiBuffer = append(csiBuffer, b)
@@ -130,6 +141,7 @@ func lineEditor(x <-chan byte, y chan<- string) {
 			y <- string(buffer)
 			buffer = nil
 			cursor = 0
+			inAlternateScreen = false
 		case ESC:
 			b2, ok := <-x
 			if !ok {
@@ -144,16 +156,11 @@ func lineEditor(x <-chan byte, y chan<- string) {
 				buffer = append(buffer[:cursor-1], buffer[cursor:]...)
 				cursor--
 			}
+		case '\n', '\r':
+			insertByte(b)
 		default:
 			if b >= 32 && b < 127 { // Printable characters
-				if cursor == len(buffer) {
-					buffer = append(buffer, b)
-				} else {
-					buffer = append(buffer, 0)
-					copy(buffer[cursor+1:], buffer[cursor:])
-					buffer[cursor] = b
-				}
-				cursor++
+				insertByte(b)
 			}
 		}
 	}
