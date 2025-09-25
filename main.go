@@ -1,5 +1,7 @@
 package main
 
+// Generated-By: Gemini 2.5 Pro and Claude 4 Sonnet
+
 import (
 	"bytes"
 	"flag"
