@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -28,13 +29,34 @@ var reading atomic.Bool
 
 func main() {
 	fifoPath := flag.String("fifo", "/tmp/script.fifo", "Path to the FIFO to read from")
-	debug := flag.Bool("debug", false, "Enable debug logging of the line editor buffer")
+	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flag.Parse()
 
-	log.Printf("Starting script2json. FIFO path: %s", *fifoPath)
+	// Configure structured logging
+	var level slog.Level
+	switch *logLevel {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		log.Fatalf("Invalid log level: %s. Must be debug, info, warn, or error", *logLevel)
+	}
 
-	if err := createFifo(*fifoPath); err != nil {
-		log.Fatalf("Error creating FIFO: %v", err)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	}))
+	slog.SetDefault(logger)
+
+	logger.Debug("Starting script2json", "fifo_path", *fifoPath)
+
+	if err := createFifo(*fifoPath, logger); err != nil {
+		logger.Error("Error creating FIFO", "error", err)
+		os.Exit(1)
 	}
 
 	// fifoByteChan streams bytes from the FIFO reader to the line editor.
@@ -44,20 +66,20 @@ func main() {
 	processedLineChan := make(chan string, 1)
 
 	// Start the concurrent processing pipeline.
-	go fifoReader(*fifoPath, fifoByteChan)
-	go lineEditor(fifoByteChan, processedLineChan, *debug)
+	go fifoReader(*fifoPath, fifoByteChan, logger)
+	go lineEditor(fifoByteChan, processedLineChan, logger)
 	go stdoutWriter(processedLineChan)
 
-	setupSignalHandling(fifoByteChan)
+	setupSignalHandling(fifoByteChan, logger)
 
 	select {}
 }
 
 // createFifo checks if the FIFO at the given path exists, and creates it if it does not.
 // Returns an error if the FIFO cannot be created or stat-ed.
-func createFifo(path string) error {
+func createFifo(path string, logger *slog.Logger) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		log.Printf("FIFO does not exist, creating at %s", path)
+		logger.Warn("FIFO does not exist, creating", "path", path)
 		if err := syscall.Mkfifo(path, 0666); err != nil {
 			return fmt.Errorf("could not create fifo: %w", err)
 		}
@@ -70,7 +92,7 @@ func createFifo(path string) error {
 // setupSignalHandling sets up signal handlers for SIGUSR1 and SIGUSR2.
 // SIGUSR1 starts data processing by setting the reading flag to true.
 // SIGUSR2 stops data processing by setting the reading flag to false and sends EOF to fifoByteChan.
-func setupSignalHandling(fifoByteChan chan<- byte) {
+func setupSignalHandling(fifoByteChan chan<- byte, logger *slog.Logger) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGUSR2)
 
@@ -78,10 +100,10 @@ func setupSignalHandling(fifoByteChan chan<- byte) {
 		for sig := range sigs {
 			switch sig {
 			case syscall.SIGUSR1:
-				log.Println("Received SIGUSR1. Starting to process data.")
+				logger.Debug("Received SIGUSR1, starting to process data")
 				reading.Store(true)
 			case syscall.SIGUSR2:
-				log.Println("Received SIGUSR2. Stopping data processing.")
+				logger.Debug("Received SIGUSR2, stopping data processing")
 				reading.Store(false)
 				fifoByteChan <- EOF
 			}
@@ -91,7 +113,7 @@ func setupSignalHandling(fifoByteChan chan<- byte) {
 
 // fifoReader opens the FIFO at the specified path, reads it byte-by-byte,
 // and sends each byte to the fifoByteChan when reading is enabled.
-func fifoReader(fifoPath string, fifoByteChan chan<- byte) {
+func fifoReader(fifoPath string, fifoByteChan chan<- byte, logger *slog.Logger) {
 	defer close(fifoByteChan)
 
 	f, err := os.OpenFile(fifoPath, os.O_RDONLY, 0666)
@@ -100,14 +122,14 @@ func fifoReader(fifoPath string, fifoByteChan chan<- byte) {
 	}
 	defer f.Close()
 
-	log.Println("FIFO opened for reading.")
+	logger.Debug("FIFO opened for reading")
 
 	buf := make([]byte, 1)
 	for {
 		_, err := f.Read(buf)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("Error reading from FIFO: %v", err)
+				logger.Error("Error reading from FIFO", "error", err)
 			}
 			break
 		}
@@ -121,7 +143,7 @@ func fifoReader(fifoPath string, fifoByteChan chan<- byte) {
 // buffer, handling ANSI control sequences for cursor movement, backspace, and
 // alternate screen mode. When it receives an EOF, it sends the cleaned buffer
 // as a string to the processedLineChan.
-func lineEditor(fifoByteChan <-chan byte, processedLineChan chan<- string, debug bool) {
+func lineEditor(fifoByteChan <-chan byte, processedLineChan chan<- string, logger *slog.Logger) {
 	var buffer []byte
 	var mu sync.Mutex
 	var csiBuffer []byte
@@ -129,19 +151,18 @@ func lineEditor(fifoByteChan <-chan byte, processedLineChan chan<- string, debug
 	inCSI := false
 	inAlternateScreen := false
 
-	if debug {
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				mu.Lock()
-				bufCopy := make([]byte, len(buffer))
-				copy(bufCopy, buffer)
-				mu.Unlock()
-				log.Printf("[DEBUG] lineEditor buffer: %q", string(bufCopy))
-			}
-		}()
-	}
+	// Start debug logging goroutine if debug level is enabled
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			mu.Lock()
+			bufCopy := make([]byte, len(buffer))
+			copy(bufCopy, buffer)
+			mu.Unlock()
+			logger.Debug("lineEditor buffer state", "buffer", string(bufCopy), "cursor", cursor)
+		}
+	}()
 
 	insertByte := func(b byte) {
 		if cursor == len(buffer) {
