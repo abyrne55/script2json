@@ -37,18 +37,24 @@ func main() {
 		log.Fatalf("Error creating FIFO: %v", err)
 	}
 
-	x := make(chan byte, 1024)
-	y := make(chan string, 1)
+	// fifoByteChan streams bytes from the FIFO reader to the line editor.
+	fifoByteChan := make(chan byte, 1024)
+	// processedLineChan sends the final, processed string from the line editor
+	// to the stdout writer.
+	processedLineChan := make(chan string, 1)
 
-	go fifoReader(*fifoPath, x)
-	go lineEditor(x, y, *debug)
-	go stdoutWriter(y)
+	// Start the concurrent processing pipeline.
+	go fifoReader(*fifoPath, fifoByteChan)
+	go lineEditor(fifoByteChan, processedLineChan, *debug)
+	go stdoutWriter(processedLineChan)
 
-	setupSignalHandling(x)
+	setupSignalHandling(fifoByteChan)
 
 	select {}
 }
 
+// createFifo checks if the FIFO at the given path exists, and creates it if it does not.
+// Returns an error if the FIFO cannot be created or stat-ed.
 func createFifo(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		log.Printf("FIFO does not exist, creating at %s", path)
@@ -61,7 +67,10 @@ func createFifo(path string) error {
 	return nil
 }
 
-func setupSignalHandling(x chan<- byte) {
+// setupSignalHandling sets up signal handlers for SIGUSR1 and SIGUSR2.
+// SIGUSR1 starts data processing by setting the reading flag to true.
+// SIGUSR2 stops data processing by setting the reading flag to false and sends EOF to fifoByteChan.
+func setupSignalHandling(fifoByteChan chan<- byte) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGUSR2)
 
@@ -74,14 +83,16 @@ func setupSignalHandling(x chan<- byte) {
 			case syscall.SIGUSR2:
 				log.Println("Received SIGUSR2. Stopping data processing.")
 				reading.Store(false)
-				x <- EOF
+				fifoByteChan <- EOF
 			}
 		}
 	}()
 }
 
-func fifoReader(fifoPath string, x chan<- byte) {
-	defer close(x)
+// fifoReader opens the FIFO at the specified path, reads it byte-by-byte,
+// and sends each byte to the fifoByteChan when reading is enabled.
+func fifoReader(fifoPath string, fifoByteChan chan<- byte) {
+	defer close(fifoByteChan)
 
 	f, err := os.OpenFile(fifoPath, os.O_RDONLY, 0666)
 	if err != nil {
@@ -101,12 +112,16 @@ func fifoReader(fifoPath string, x chan<- byte) {
 			break
 		}
 		if reading.Load() {
-			x <- buf[0]
+			fifoByteChan <- buf[0]
 		}
 	}
 }
 
-func lineEditor(x <-chan byte, y chan<- string, debug bool) {
+// lineEditor reads bytes from fifoByteChan and processes them into a clean
+// buffer, handling ANSI control sequences for cursor movement, backspace, and
+// alternate screen mode. When it receives an EOF, it sends the cleaned buffer
+// as a string to the processedLineChan.
+func lineEditor(fifoByteChan <-chan byte, processedLineChan chan<- string, debug bool) {
 	var buffer []byte
 	var mu sync.Mutex
 	var csiBuffer []byte
@@ -139,7 +154,7 @@ func lineEditor(x <-chan byte, y chan<- string, debug bool) {
 		cursor++
 	}
 
-	for b := range x {
+	for b := range fifoByteChan {
 		if inCSI {
 			csiBuffer = append(csiBuffer, b)
 			if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '~' {
@@ -161,12 +176,12 @@ func lineEditor(x <-chan byte, y chan<- string, debug bool) {
 		switch b {
 		case EOF:
 			mu.Lock()
-			y <- string(buffer)
+			processedLineChan <- string(buffer)
 			buffer = nil
 			cursor = 0
 			mu.Unlock()
 		case ESC:
-			b2, ok := <-x
+			b2, ok := <-fifoByteChan
 			if !ok {
 				continue
 			}
@@ -193,9 +208,15 @@ func lineEditor(x <-chan byte, y chan<- string, debug bool) {
 			}
 		}
 	}
-	close(y)
+	close(processedLineChan)
 }
 
+// handleCSI processes a Control Sequence Introducer (CSI) escape sequence.
+// It updates the buffer, cursor position, and alternate screen mode state as appropriate.
+// - seq: the CSI sequence bytes
+// - buffer: pointer to the current line buffer
+// - cursor: pointer to the current cursor position within the buffer
+// - inAlternateScreen: pointer to a bool indicating if alternate screen mode is active
 func handleCSI(seq []byte, buffer *[]byte, cursor *int, inAlternateScreen *bool) {
 	if bytes.HasSuffix(seq, []byte("h")) && bytes.Contains(seq, []byte("?1049")) {
 		*inAlternateScreen = true
@@ -215,8 +236,10 @@ func handleCSI(seq []byte, buffer *[]byte, cursor *int, inAlternateScreen *bool)
 	}
 }
 
-func stdoutWriter(y <-chan string) {
-	for line := range y {
+// stdoutWriter waits for a processed line to appear on the processedLineChan
+// and prints it directly to standard output.
+func stdoutWriter(processedLineChan <-chan string) {
+	for line := range processedLineChan {
 		fmt.Println(line)
 	}
 }

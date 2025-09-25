@@ -1,7 +1,9 @@
-name: script2json
-description: "A Go application that reads from a FIFO, processes terminal control sequences, and outputs cleaned strings."
-author: "AI Assistant"
-version: "1.0.0"
+
+# script2json
+Generated-By: Gemini 2.5 Pro
+
+A Go application that reads from a FIFO, processes terminal control sequences, and outputs cleaned strings.
+
 
 instructions: |
   1. Build the application:
