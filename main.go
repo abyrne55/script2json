@@ -8,8 +8,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 const (
@@ -26,6 +28,7 @@ var reading atomic.Bool
 
 func main() {
 	fifoPath := flag.String("fifo", "/tmp/script.fifo", "Path to the FIFO to read from")
+	debug := flag.Bool("debug", false, "Enable debug logging of the line editor buffer")
 	flag.Parse()
 
 	log.Printf("Starting script2json. FIFO path: %s", *fifoPath)
@@ -38,7 +41,7 @@ func main() {
 	y := make(chan string, 1)
 
 	go fifoReader(*fifoPath, x)
-	go lineEditor(x, y)
+	go lineEditor(x, y, *debug)
 	go stdoutWriter(y)
 
 	setupSignalHandling(x)
@@ -103,12 +106,27 @@ func fifoReader(fifoPath string, x chan<- byte) {
 	}
 }
 
-func lineEditor(x <-chan byte, y chan<- string) {
+func lineEditor(x <-chan byte, y chan<- string, debug bool) {
 	var buffer []byte
+	var mu sync.Mutex
 	var csiBuffer []byte
 	cursor := 0
 	inCSI := false
 	inAlternateScreen := false
+
+	if debug {
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				mu.Lock()
+				bufCopy := make([]byte, len(buffer))
+				copy(bufCopy, buffer)
+				mu.Unlock()
+				log.Printf("[DEBUG] lineEditor buffer: %q", string(bufCopy))
+			}
+		}()
+	}
 
 	insertByte := func(b byte) {
 		if cursor == len(buffer) {
@@ -126,22 +144,27 @@ func lineEditor(x <-chan byte, y chan<- string) {
 			csiBuffer = append(csiBuffer, b)
 			if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '~' {
 				inCSI = false
+				mu.Lock()
 				handleCSI(csiBuffer, &buffer, &cursor, &inAlternateScreen)
+				mu.Unlock()
 				csiBuffer = nil
 			}
 			continue
 		}
 
-		if inAlternateScreen {
+		// If in alternate screen mode, ignore everything except the ESCAPE character
+		// which is needed to process the exit sequence.
+		if inAlternateScreen && b != ESC {
 			continue
 		}
 
 		switch b {
 		case EOF:
+			mu.Lock()
 			y <- string(buffer)
 			buffer = nil
 			cursor = 0
-			inAlternateScreen = false
+			mu.Unlock()
 		case ESC:
 			b2, ok := <-x
 			if !ok {
@@ -152,15 +175,21 @@ func lineEditor(x <-chan byte, y chan<- string) {
 				csiBuffer = []byte{}
 			}
 		case BACKSPACE, DEL:
+			mu.Lock()
 			if cursor > 0 {
 				buffer = append(buffer[:cursor-1], buffer[cursor:]...)
 				cursor--
 			}
+			mu.Unlock()
 		case '\n', '\r':
+			mu.Lock()
 			insertByte(b)
+			mu.Unlock()
 		default:
 			if b >= 32 && b < 127 { // Printable characters
+				mu.Lock()
 				insertByte(b)
+				mu.Unlock()
 			}
 		}
 	}
