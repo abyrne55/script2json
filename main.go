@@ -65,14 +65,14 @@ func main() {
 
 	// scriptFifoByteChan streams bytes from the script FIFO reader to the line editor.
 	scriptFifoByteChan := make(chan byte, 1024)
-	// processedLineChan sends the final, processed string from the line editor
+	// commandOutputChan sends the final, processed string from the line editor
 	// to the stdout writer.
-	processedLineChan := make(chan string, 1)
+	commandOutputChan := make(chan string, 1)
 
 	// Start the concurrent processing pipeline.
 	go scriptFifoReader(*scriptFifoPath, scriptFifoByteChan, logger)
-	go lineEditor(scriptFifoByteChan, processedLineChan, logger)
-	go stdoutWriter(processedLineChan)
+	go lineEditor(scriptFifoByteChan, commandOutputChan, logger)
+	go stdoutWriter(commandOutputChan)
 
 	setupSignalHandling(scriptFifoByteChan, logger)
 
@@ -146,8 +146,8 @@ func scriptFifoReader(scriptFifoPath string, scriptFifoByteChan chan<- byte, log
 // lineEditor reads bytes from scriptFifoByteChan and processes them into a clean
 // buffer, handling ANSI control sequences for cursor movement, backspace, and
 // alternate screen mode. When it receives an EOF, it sends the cleaned buffer
-// as a string to the processedLineChan.
-func lineEditor(scriptFifoByteChan <-chan byte, processedLineChan chan<- string, logger *slog.Logger) {
+// as a string to the commandOutputChan.
+func lineEditor(scriptFifoByteChan <-chan byte, commandOutputChan chan<- string, logger *slog.Logger) {
 	var buffer []byte
 	var mu sync.Mutex
 	var csiBuffer []byte
@@ -201,7 +201,7 @@ func lineEditor(scriptFifoByteChan <-chan byte, processedLineChan chan<- string,
 		switch b {
 		case EOF:
 			mu.Lock()
-			processedLineChan <- string(buffer)
+			commandOutputChan <- string(buffer)
 			buffer = nil
 			cursor = 0
 			mu.Unlock()
@@ -233,7 +233,7 @@ func lineEditor(scriptFifoByteChan <-chan byte, processedLineChan chan<- string,
 			}
 		}
 	}
-	close(processedLineChan)
+	close(commandOutputChan)
 }
 
 // handleCSI processes a Control Sequence Introducer (CSI) escape sequence.
@@ -261,10 +261,10 @@ func handleCSI(seq []byte, buffer *[]byte, cursor *int, inAlternateScreen *bool)
 	}
 }
 
-// stdoutWriter waits for a processed line to appear on the processedLineChan
+// stdoutWriter waits for a processed line to appear on the commandOutputChan
 // and prints it directly to standard output.
-func stdoutWriter(processedLineChan <-chan string) {
-	for line := range processedLineChan {
+func stdoutWriter(commandOutputChan <-chan string) {
+	for line := range commandOutputChan {
 		fmt.Println(line)
 	}
 }
