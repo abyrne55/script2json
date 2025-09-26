@@ -27,10 +27,12 @@ const (
 	ARROW_RIGHT = 'C'
 )
 
+// reading is an atomic boolean flag used to indicate whether the program is currently reading from the script FIFO.
+// It provides safe concurrent access for goroutines that need to check or update the reading state.
 var reading atomic.Bool
 
 func main() {
-	fifoPath := flag.String("fifo", "/tmp/script.fifo", "Path to the FIFO to read from")
+	scriptFifoPath := flag.String("script-fifo", "/tmp/script.fifo", "Path to the script FIFO to read from")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flag.Parse()
 
@@ -54,47 +56,47 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	logger.Debug("Starting script2json", "fifo_path", *fifoPath)
+	logger.Debug("Starting script2json", "script_fifo_path", *scriptFifoPath)
 
-	if err := createFifo(*fifoPath, logger); err != nil {
-		logger.Error("Error creating FIFO", "error", err)
+	if err := createScriptFifo(*scriptFifoPath, logger); err != nil {
+		logger.Error("Error creating script FIFO", "error", err)
 		os.Exit(1)
 	}
 
-	// fifoByteChan streams bytes from the FIFO reader to the line editor.
-	fifoByteChan := make(chan byte, 1024)
+	// scriptFifoByteChan streams bytes from the script FIFO reader to the line editor.
+	scriptFifoByteChan := make(chan byte, 1024)
 	// processedLineChan sends the final, processed string from the line editor
 	// to the stdout writer.
 	processedLineChan := make(chan string, 1)
 
 	// Start the concurrent processing pipeline.
-	go fifoReader(*fifoPath, fifoByteChan, logger)
-	go lineEditor(fifoByteChan, processedLineChan, logger)
+	go scriptFifoReader(*scriptFifoPath, scriptFifoByteChan, logger)
+	go lineEditor(scriptFifoByteChan, processedLineChan, logger)
 	go stdoutWriter(processedLineChan)
 
-	setupSignalHandling(fifoByteChan, logger)
+	setupSignalHandling(scriptFifoByteChan, logger)
 
 	select {}
 }
 
-// createFifo checks if the FIFO at the given path exists, and creates it if it does not.
-// Returns an error if the FIFO cannot be created or stat-ed.
-func createFifo(path string, logger *slog.Logger) error {
+// createScriptFifo checks if the script FIFO at the given path exists, and creates it if it does not.
+// Returns an error if the script FIFO cannot be created or stat-ed.
+func createScriptFifo(path string, logger *slog.Logger) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		logger.Warn("FIFO does not exist, creating", "path", path)
+		logger.Warn("Script FIFO does not exist, creating", "path", path)
 		if err := syscall.Mkfifo(path, 0666); err != nil {
-			return fmt.Errorf("could not create fifo: %w", err)
+			return fmt.Errorf("could not create script fifo: %w", err)
 		}
 	} else if err != nil {
-		return fmt.Errorf("could not stat fifo: %w", err)
+		return fmt.Errorf("could not stat script fifo: %w", err)
 	}
 	return nil
 }
 
 // setupSignalHandling sets up signal handlers for SIGUSR1 and SIGUSR2.
 // SIGUSR1 starts data processing by setting the reading flag to true.
-// SIGUSR2 stops data processing by setting the reading flag to false and sends EOF to fifoByteChan.
-func setupSignalHandling(fifoByteChan chan<- byte, logger *slog.Logger) {
+// SIGUSR2 stops data processing by setting the reading flag to false and sends EOF to scriptFifoByteChan.
+func setupSignalHandling(scriptFifoByteChan chan<- byte, logger *slog.Logger) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGUSR2)
 
@@ -107,45 +109,45 @@ func setupSignalHandling(fifoByteChan chan<- byte, logger *slog.Logger) {
 			case syscall.SIGUSR2:
 				logger.Debug("Received SIGUSR2, stopping data processing")
 				reading.Store(false)
-				fifoByteChan <- EOF
+				scriptFifoByteChan <- EOF
 			}
 		}
 	}()
 }
 
-// fifoReader opens the FIFO at the specified path, reads it byte-by-byte,
-// and sends each byte to the fifoByteChan when reading is enabled.
-func fifoReader(fifoPath string, fifoByteChan chan<- byte, logger *slog.Logger) {
-	defer close(fifoByteChan)
+// scriptFifoReader opens the script FIFO at the specified path, reads it byte-by-byte,
+// and sends each byte to the scriptFifoByteChan when reading is enabled.
+func scriptFifoReader(scriptFifoPath string, scriptFifoByteChan chan<- byte, logger *slog.Logger) {
+	defer close(scriptFifoByteChan)
 
-	f, err := os.OpenFile(fifoPath, os.O_RDONLY, 0666)
+	f, err := os.OpenFile(scriptFifoPath, os.O_RDONLY, 0666)
 	if err != nil {
-		log.Fatalf("Error opening FIFO: %v", err)
+		log.Fatalf("Error opening script FIFO: %v", err)
 	}
 	defer f.Close()
 
-	logger.Debug("FIFO opened for reading")
+	logger.Debug("Script FIFO opened for reading")
 
 	buf := make([]byte, 1)
 	for {
 		_, err := f.Read(buf)
 		if err != nil {
 			if err != io.EOF {
-				logger.Error("Error reading from FIFO", "error", err)
+				logger.Error("Error reading from script FIFO", "error", err)
 			}
 			break
 		}
 		if reading.Load() {
-			fifoByteChan <- buf[0]
+			scriptFifoByteChan <- buf[0]
 		}
 	}
 }
 
-// lineEditor reads bytes from fifoByteChan and processes them into a clean
+// lineEditor reads bytes from scriptFifoByteChan and processes them into a clean
 // buffer, handling ANSI control sequences for cursor movement, backspace, and
 // alternate screen mode. When it receives an EOF, it sends the cleaned buffer
 // as a string to the processedLineChan.
-func lineEditor(fifoByteChan <-chan byte, processedLineChan chan<- string, logger *slog.Logger) {
+func lineEditor(scriptFifoByteChan <-chan byte, processedLineChan chan<- string, logger *slog.Logger) {
 	var buffer []byte
 	var mu sync.Mutex
 	var csiBuffer []byte
@@ -177,7 +179,7 @@ func lineEditor(fifoByteChan <-chan byte, processedLineChan chan<- string, logge
 		cursor++
 	}
 
-	for b := range fifoByteChan {
+	for b := range scriptFifoByteChan {
 		if inCSI {
 			csiBuffer = append(csiBuffer, b)
 			if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '~' {
@@ -204,7 +206,7 @@ func lineEditor(fifoByteChan <-chan byte, processedLineChan chan<- string, logge
 			cursor = 0
 			mu.Unlock()
 		case ESC:
-			b2, ok := <-fifoByteChan
+			b2, ok := <-scriptFifoByteChan
 			if !ok {
 				continue
 			}
