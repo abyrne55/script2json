@@ -184,37 +184,51 @@ func scriptFifoReader(scriptFifoPath string, scriptFifoByteChan chan<- byte, log
 func commandFifoReader(commandFifoPath string, commandChan chan<- string, logger *slog.Logger) {
 	defer close(commandChan)
 
-	f, err := os.OpenFile(commandFifoPath, os.O_RDONLY, 0666)
-	if err != nil {
-		log.Fatalf("Error opening command FIFO: %v", err)
-	}
-	defer f.Close()
-
-	logger.Debug("Command FIFO opened for reading")
+	logger.Debug("Command FIFO reader starting")
 
 	buf := make([]byte, 1024)
 	var commandBuffer []byte
 
 	for {
-		n, err := f.Read(buf)
+		// Re-open the FIFO for each read session
+		f, err := os.OpenFile(commandFifoPath, os.O_RDONLY, 0666)
 		if err != nil {
-			if err != io.EOF {
-				logger.Error("Error reading from command FIFO", "error", err)
-			}
+			logger.Error("Error opening command FIFO", "error", err)
 			break
 		}
 
-		for i := 0; i < n; i++ {
-			if buf[i] == '\n' {
-				// Send complete command
-				if len(commandBuffer) > 0 {
-					commandChan <- string(commandBuffer)
-					commandBuffer = nil
+		logger.Debug("Command FIFO opened for reading")
+
+		// Read until EOF (writer closes)
+		for {
+			n, err := f.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					logger.Debug("Command FIFO writer closed, will reopen")
+					break // Break inner loop to reopen FIFO
 				}
-			} else {
-				commandBuffer = append(commandBuffer, buf[i])
+				logger.Error("Error reading from command FIFO", "error", err)
+				f.Close()
+				return
+			}
+
+			for i := 0; i < n; i++ {
+				if buf[i] == '\n' {
+					// Send complete command
+					if len(commandBuffer) > 0 {
+						commandChan <- string(commandBuffer)
+						logger.Debug("Sent command to commandChan", "command", string(commandBuffer))
+						commandBuffer = nil
+					}
+				} else {
+					//logger.Debug("Appended byte to commandBuffer", "byte", string(buf[i]))
+					commandBuffer = append(commandBuffer, buf[i])
+				}
 			}
 		}
+
+		f.Close()
+		// Continue outer loop to reopen FIFO
 	}
 }
 
