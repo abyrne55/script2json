@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -11,11 +12,20 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
+
+// CommandRecord is a record of a single command and its output.
+type CommandRecord struct {
+	ID              string    `json:"id"`
+	Command         string    `json:"command"`
+	Output          string    `json:"output"`
+	ReturnTimestamp time.Time `json:"return_timestamp"`
+}
 
 const (
 	EOF         = 0x04
@@ -31,8 +41,12 @@ const (
 // It provides safe concurrent access for goroutines that need to check or update the reading state.
 var reading atomic.Bool
 
+// recordID is a monotonically increasing counter for CommandRecord IDs
+var recordID atomic.Uint64
+
 func main() {
 	scriptFifoPath := flag.String("script-fifo", "/tmp/script.fifo", "Path to the script FIFO to read from")
+	commandFifoPath := flag.String("command-fifo", "/tmp/command.fifo", "Path to the command FIFO to read from")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flag.Parse()
 
@@ -63,16 +77,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := createCommandFifo(*commandFifoPath, logger); err != nil {
+		logger.Error("Error creating command FIFO", "error", err)
+		os.Exit(1)
+	}
+
 	// scriptFifoByteChan streams bytes from the script FIFO reader to the line editor.
 	scriptFifoByteChan := make(chan byte, 1024)
 	// commandOutputChan sends the final, processed string from the line editor
-	// to the stdout writer.
+	// to the record creator.
 	commandOutputChan := make(chan string, 1)
+	// commandChan streams command strings from the command FIFO reader to the record creator.
+	commandChan := make(chan string, 1)
 
 	// Start the concurrent processing pipeline.
 	go scriptFifoReader(*scriptFifoPath, scriptFifoByteChan, logger)
+	go commandFifoReader(*commandFifoPath, commandChan, logger)
 	go lineEditor(scriptFifoByteChan, commandOutputChan, logger)
-	go stdoutWriter(commandOutputChan)
+	go recordCreator(commandOutputChan, commandChan)
 
 	setupSignalHandling(scriptFifoByteChan, logger)
 
@@ -89,6 +111,20 @@ func createScriptFifo(path string, logger *slog.Logger) error {
 		}
 	} else if err != nil {
 		return fmt.Errorf("could not stat script fifo: %w", err)
+	}
+	return nil
+}
+
+// createCommandFifo checks if the command FIFO at the given path exists, and creates it if it does not.
+// Returns an error if the command FIFO cannot be created or stat-ed.
+func createCommandFifo(path string, logger *slog.Logger) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		logger.Warn("Command FIFO does not exist, creating", "path", path)
+		if err := syscall.Mkfifo(path, 0666); err != nil {
+			return fmt.Errorf("could not create command fifo: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("could not stat command fifo: %w", err)
 	}
 	return nil
 }
@@ -143,6 +179,45 @@ func scriptFifoReader(scriptFifoPath string, scriptFifoByteChan chan<- byte, log
 	}
 }
 
+// commandFifoReader opens the command FIFO at the specified path, reads it line-by-line,
+// and sends each line to the commandChan.
+func commandFifoReader(commandFifoPath string, commandChan chan<- string, logger *slog.Logger) {
+	defer close(commandChan)
+
+	f, err := os.OpenFile(commandFifoPath, os.O_RDONLY, 0666)
+	if err != nil {
+		log.Fatalf("Error opening command FIFO: %v", err)
+	}
+	defer f.Close()
+
+	logger.Debug("Command FIFO opened for reading")
+
+	buf := make([]byte, 1024)
+	var commandBuffer []byte
+
+	for {
+		n, err := f.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				logger.Error("Error reading from command FIFO", "error", err)
+			}
+			break
+		}
+
+		for i := 0; i < n; i++ {
+			if buf[i] == '\n' {
+				// Send complete command
+				if len(commandBuffer) > 0 {
+					commandChan <- string(commandBuffer)
+					commandBuffer = nil
+				}
+			} else {
+				commandBuffer = append(commandBuffer, buf[i])
+			}
+		}
+	}
+}
+
 // lineEditor reads bytes from scriptFifoByteChan and processes them into a clean
 // buffer, handling ANSI control sequences for cursor movement, backspace, and
 // alternate screen mode. When it receives an EOF, it sends the cleaned buffer
@@ -164,6 +239,7 @@ func lineEditor(scriptFifoByteChan <-chan byte, commandOutputChan chan<- string,
 			bufCopy := make([]byte, len(buffer))
 			copy(bufCopy, buffer)
 			mu.Unlock()
+
 			logger.Debug("lineEditor buffer state", "buffer", string(bufCopy), "cursor", cursor)
 		}
 	}()
@@ -261,10 +337,36 @@ func handleCSI(seq []byte, buffer *[]byte, cursor *int, inAlternateScreen *bool)
 	}
 }
 
-// stdoutWriter waits for a processed line to appear on the commandOutputChan
-// and prints it directly to standard output.
-func stdoutWriter(commandOutputChan <-chan string) {
-	for line := range commandOutputChan {
-		fmt.Println(line)
+// recordCreator creates CommandRecord instances from output and command data.
+// It sets a monotonically increasing ID, return timestamp, copies data from commandOutputChan
+// into the Output field, and reads from commandChan into the Command field.
+func recordCreator(commandOutputChan <-chan string, commandChan <-chan string) {
+	for output := range commandOutputChan {
+		// Read the corresponding command
+		var command string
+		select {
+		case command = <-commandChan:
+			// Got a command
+		default:
+			// No command available, use empty string
+			command = ""
+		}
+
+		// Create the record
+		record := CommandRecord{
+			ID:              strconv.FormatUint(recordID.Add(1), 10),
+			Command:         command,
+			Output:          output,
+			ReturnTimestamp: time.Now(),
+		}
+
+		// Output as JSON
+		jsonData, err := json.Marshal(record)
+		if err != nil {
+			log.Printf("Error marshaling record to JSON: %v", err)
+			continue
+		}
+
+		fmt.Println(string(jsonData))
 	}
 }
