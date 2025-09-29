@@ -4,6 +4,15 @@ Generated-By: Gemini 2.5 Pro
 
 A Go application that reads from a FIFO, processes terminal control sequences, and outputs cleaned strings in a JSON format.
 
+## Flags
+
+The application supports the following command-line flags:
+
+- `--script-fifo`: Path to the script FIFO to read from (default: `/tmp/script.fifo`)
+- `--command-fifo`: Path to the command FIFO to read from (default: `/tmp/command.fifo`)
+- `--log-level`: Log level for application output. Valid values: `debug`, `info`, `warn`, `error` (default: `info`)
+- `--pid-file`: Path to write PID file. When specified, the application will write its process ID to this file on startup and automatically clean it up on termination (optional)
+
  ## Usage
 
   1. Build and install the application
