@@ -48,6 +48,7 @@ func main() {
 	scriptFifoPath := flag.String("script-fifo", "/tmp/script.fifo", "Path to the script FIFO to read from")
 	commandFifoPath := flag.String("command-fifo", "/tmp/command.fifo", "Path to the command FIFO to read from")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	pidFile := flag.String("pid-file", "", "Path to write PID file (optional)")
 	flag.Parse()
 
 	// Configure structured logging
@@ -82,6 +83,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Write PID file if specified
+	if *pidFile != "" {
+		if err := writePidFile(*pidFile, logger); err != nil {
+			logger.Error("Error writing PID file", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// scriptFifoByteChan streams bytes from the script FIFO reader to the line editor.
 	scriptFifoByteChan := make(chan byte, 1024)
 	// commandOutputChan sends the final, processed string from the line editor
@@ -96,7 +105,7 @@ func main() {
 	go lineEditor(scriptFifoByteChan, commandOutputChan, logger)
 	go recordCreator(commandOutputChan, commandChan)
 
-	setupSignalHandling(scriptFifoByteChan, logger)
+	setupSignalHandling(scriptFifoByteChan, *pidFile, logger)
 
 	select {}
 }
@@ -129,12 +138,37 @@ func createCommandFifo(path string, logger *slog.Logger) error {
 	return nil
 }
 
-// setupSignalHandling sets up signal handlers for SIGUSR1 and SIGUSR2.
+// writePidFile writes the current process ID to the specified file.
+// Returns an error if the file cannot be created or written to.
+func writePidFile(path string, logger *slog.Logger) error {
+	pid := os.Getpid()
+	pidStr := fmt.Sprintf("%d\n", pid)
+
+	if err := os.WriteFile(path, []byte(pidStr), 0644); err != nil {
+		return fmt.Errorf("could not write PID file: %w", err)
+	}
+
+	logger.Debug("PID file written", "path", path, "pid", pid)
+	return nil
+}
+
+// removePidFile removes the PID file at the specified path.
+// Logs a warning if the file cannot be removed, but does not return an error.
+func removePidFile(path string, logger *slog.Logger) {
+	if err := os.Remove(path); err != nil {
+		logger.Warn("Could not remove PID file", "path", path, "error", err)
+	} else {
+		logger.Debug("PID file removed", "path", path)
+	}
+}
+
+// setupSignalHandling sets up signal handlers for SIGUSR1, SIGUSR2, and termination signals.
 // SIGUSR1 starts data processing by setting the reading flag to true.
 // SIGUSR2 stops data processing by setting the reading flag to false and sends EOF to scriptFifoByteChan.
-func setupSignalHandling(scriptFifoByteChan chan<- byte, logger *slog.Logger) {
+// Termination signals (SIGINT, SIGTERM) clean up the PID file and exit gracefully.
+func setupSignalHandling(scriptFifoByteChan chan<- byte, pidFilePath string, logger *slog.Logger) {
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGUSR2)
+	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		for sig := range sigs {
@@ -146,6 +180,12 @@ func setupSignalHandling(scriptFifoByteChan chan<- byte, logger *slog.Logger) {
 				logger.Debug("Received SIGUSR2, stopping data processing")
 				reading.Store(false)
 				scriptFifoByteChan <- EOF
+			case syscall.SIGINT, syscall.SIGTERM:
+				logger.Debug("Received termination signal, cleaning up", "signal", sig)
+				if pidFilePath != "" {
+					removePidFile(pidFilePath, logger)
+				}
+				os.Exit(0)
 			}
 		}
 	}()
