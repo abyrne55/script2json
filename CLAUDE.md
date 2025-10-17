@@ -225,8 +225,10 @@ hello
 ```
 script2json/
 ├── main.go                      # Entire application (single file)
+├── main_test.go                 # Comprehensive test suite (72.8% coverage)
 ├── go.mod                       # Go module definition
 ├── README.md                    # User documentation
+├── CLAUDE.md                    # This file - project overview for Claude
 ├── LICENSE                      # Apache 2.0 license
 └── examples/
     ├── sample_input.typescript  # Raw script output example
@@ -370,6 +372,79 @@ script2json --pid-file /tmp/script2json.pid &
 # Later, if desync detected:
 kill -HUP $(cat /tmp/script2json.pid)
 ```
+
+## Testing
+
+### Test Suite Overview
+script2json includes a comprehensive test suite in `main_test.go` with **72.8% code coverage**.
+
+### Test Coverage (17 test functions, 24 subtests)
+
+1. **ANSI/CSI Sequence Handling** (`TestHandleCSI`)
+   - Enter/exit alternate screen mode
+   - Arrow left/right cursor movements
+   - Boundary conditions (cursor at start/end)
+
+2. **Line Editor Functionality**
+   - `TestLineEditorBasicInput`: Basic character input
+   - `TestLineEditorBackspace`: DEL/backspace handling
+   - `TestLineEditorAlternateScreen`: Filtering alternate screen content
+   - `TestLineEditorCursorMovement`: Arrow key cursor positioning
+   - `TestLineEditorReset`: State reset via resetChan
+
+3. **Record Creation**
+   - `TestRecordCreator`: JSON record creation and output
+   - `TestRecordCreatorReset`: Channel draining on reset
+   - `TestRecordIDIncrement`: Concurrent monotonic counter
+
+4. **FIFO Management**
+   - `TestCreateScriptFifo`: Script FIFO creation
+   - `TestCreateCommandFifo`: Command FIFO creation
+
+5. **PID File Management**
+   - `TestWritePidFile`: PID file creation and content
+   - `TestRemovePidFile`: PID file cleanup
+
+6. **Signal Handling**
+   - `TestSignalHandlingSetup`: Setup without panic
+   - `TestSignalHandlingUSR1`: SIGUSR1 starts reading
+   - `TestSignalHandlingUSR2`: SIGUSR2 stops reading and sends EOF
+   - `TestSignalHandlingHUP`: SIGHUP resets state
+
+7. **End-to-End Integration** (`TestEndToEnd`)
+   - Complete pipeline from FIFOs to JSON output
+   - Multiple commands with proper signal timing
+   - ANSI sequence stripping verification
+   - Monotonic ID verification
+   - Timestamp verification
+   - PID file verification
+
+### Running Tests
+
+```bash
+# Run all tests
+go test
+
+# Run with verbose output
+go test -v
+
+# Run with coverage
+go test -coverprofile=coverage.out
+
+# View coverage report
+go tool cover -html=coverage.out
+
+# Run specific test
+go test -run TestEndToEnd -v
+```
+
+### Test Design Principles
+
+- **Isolation**: Each test uses temporary directories and separate goroutines
+- **Realistic**: End-to-end test simulates actual FIFO/signal workflow
+- **Coverage**: Tests focus on script2json logic, not Go language features
+- **Cleanup**: All tests properly clean up resources (FIFOs, temp dirs, goroutines)
+- **Timing**: Tests account for goroutine scheduling with appropriate sleeps
 
 ## Potential Enhancements
 
