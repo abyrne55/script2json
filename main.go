@@ -47,6 +47,9 @@ var recordID atomic.Uint64
 // resetChan is used to signal a reset of the lineEditor state
 var resetChan = make(chan struct{}, 1)
 
+// recordCreatorResetChan is used to signal a reset of the recordCreator state
+var recordCreatorResetChan = make(chan struct{}, 1)
+
 func main() {
 	scriptFifoPath := flag.String("script-fifo", "/tmp/script.fifo", "Path to the script FIFO to read from")
 	commandFifoPath := flag.String("command-fifo", "/tmp/command.fifo", "Path to the command FIFO to read from")
@@ -185,14 +188,21 @@ func setupSignalHandling(scriptFifoByteChan chan<- byte, pidFilePath string, log
 				reading.Store(false)
 				scriptFifoByteChan <- EOF
 			case syscall.SIGHUP:
-				logger.Info("Received SIGHUP, resetting lineEditor state")
+				logger.Info("Received SIGHUP, resetting all pipeline state")
 				// Stop reading to prevent corrupted data
 				wasReading := reading.Load()
 				reading.Store(false)
 
-				// Send reset signal (non-blocking)
+				// Send reset signal to lineEditor (non-blocking)
 				select {
 				case resetChan <- struct{}{}:
+				default:
+					// Reset already pending
+				}
+
+				// Send reset signal to recordCreator (non-blocking)
+				select {
+				case recordCreatorResetChan <- struct{}{}:
 				default:
 					// Reset already pending
 				}
@@ -202,7 +212,7 @@ func setupSignalHandling(scriptFifoByteChan chan<- byte, pidFilePath string, log
 					scriptFifoByteChan <- EOF
 				}
 
-				logger.Info("Reset signal sent, lineEditor state will be cleared")
+				logger.Info("Reset signals sent, all pipeline state will be cleared")
 			case syscall.SIGINT, syscall.SIGTERM:
 				logger.Debug("Received termination signal, cleaning up", "signal", sig)
 				if pidFilePath != "" {
@@ -307,7 +317,21 @@ func lineEditor(scriptFifoByteChan <-chan byte, commandOutputChan chan<- string,
 	inCSI := false
 	inAlternateScreen := false
 
-	// resetState clears all lineEditor state
+	// drainChannel drains all pending bytes from scriptFifoByteChan
+	drainChannel := func() {
+		drained := 0
+		for {
+			select {
+			case <-scriptFifoByteChan:
+				drained++
+			default:
+				logger.Debug("lineEditor channel drained", "bytes_discarded", drained)
+				return
+			}
+		}
+	}
+
+	// resetState clears all lineEditor state and drains input channel
 	resetState := func() {
 		mu.Lock()
 		defer mu.Unlock()
@@ -316,7 +340,10 @@ func lineEditor(scriptFifoByteChan <-chan byte, commandOutputChan chan<- string,
 		cursor = 0
 		inCSI = false
 		inAlternateScreen = false
-		logger.Debug("lineEditor state reset", "buffer_cleared", true)
+		logger.Debug("lineEditor state cleared")
+
+		// Drain any buffered bytes from the input channel
+		drainChannel()
 	}
 
 	// Start debug logging goroutine if debug level is enabled
@@ -436,7 +463,39 @@ func handleCSI(seq []byte, buffer *[]byte, cursor *int, inAlternateScreen *bool)
 // recordCreator creates CommandRecord instances from output and command data.
 // It sets a monotonically increasing ID, return timestamp, copies data from commandOutputChan
 // into the Output field, and reads from commandChan into the Command field.
+// Can be reset via recordCreatorResetChan to drain stale data.
 func recordCreator(commandOutputChan <-chan string, commandChan <-chan string) {
+	// Start goroutine to monitor for reset signals
+	go func() {
+		for range recordCreatorResetChan {
+			// Drain commandOutputChan
+			outputDrained := 0
+			for {
+				select {
+				case <-commandOutputChan:
+					outputDrained++
+				default:
+					slog.Debug("recordCreator commandOutputChan drained", "items_discarded", outputDrained)
+					goto drainCommands
+				}
+			}
+
+		drainCommands:
+			// Drain commandChan
+			commandDrained := 0
+			for {
+				select {
+				case <-commandChan:
+					commandDrained++
+				default:
+					slog.Debug("recordCreator commandChan drained", "items_discarded", commandDrained)
+					slog.Info("recordCreator channels drained", "outputs_discarded", outputDrained, "commands_discarded", commandDrained)
+					return
+				}
+			}
+		}
+	}()
+
 	for output := range commandOutputChan {
 		// Read the corresponding command
 		var command string
