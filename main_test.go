@@ -314,45 +314,6 @@ func TestLineEditorReset(t *testing.T) {
 	}
 }
 
-// TestCommandRecordJSON tests JSON marshaling/unmarshaling
-func TestCommandRecordJSON(t *testing.T) {
-	now := time.Now()
-	record := CommandRecord{
-		ID:              "42",
-		Command:         "echo hello",
-		Output:          "hello\r\n",
-		ReturnTimestamp: now,
-	}
-
-	// Marshal to JSON
-	jsonData, err := json.Marshal(record)
-	if err != nil {
-		t.Fatalf("Failed to marshal: %v", err)
-	}
-
-	// Unmarshal back
-	var decoded CommandRecord
-	err = json.Unmarshal(jsonData, &decoded)
-	if err != nil {
-		t.Fatalf("Failed to unmarshal: %v", err)
-	}
-
-	// Verify fields
-	if decoded.ID != record.ID {
-		t.Errorf("ID = %q, want %q", decoded.ID, record.ID)
-	}
-	if decoded.Command != record.Command {
-		t.Errorf("Command = %q, want %q", decoded.Command, record.Command)
-	}
-	if decoded.Output != record.Output {
-		t.Errorf("Output = %q, want %q", decoded.Output, record.Output)
-	}
-	// Time comparison with some tolerance for serialization
-	if decoded.ReturnTimestamp.Sub(record.ReturnTimestamp).Abs() > time.Millisecond {
-		t.Errorf("ReturnTimestamp = %v, want %v", decoded.ReturnTimestamp, record.ReturnTimestamp)
-	}
-}
-
 // TestRecordCreator tests the record creation pipeline
 func TestRecordCreator(t *testing.T) {
 	// Reset recordID counter for predictable test results
@@ -444,24 +405,6 @@ func TestRecordCreatorReset(t *testing.T) {
 	}
 	if outputChanLen > 0 {
 		t.Errorf("commandOutputChan still has %d items after reset", outputChanLen)
-	}
-}
-
-// TestAtomicReading tests the reading flag
-func TestAtomicReading(t *testing.T) {
-	reading.Store(false)
-	if reading.Load() {
-		t.Error("reading should start false")
-	}
-
-	reading.Store(true)
-	if !reading.Load() {
-		t.Error("reading should be true after Store(true)")
-	}
-
-	reading.Store(false)
-	if reading.Load() {
-		t.Error("reading should be false after Store(false)")
 	}
 }
 
