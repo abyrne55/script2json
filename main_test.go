@@ -1,11 +1,14 @@
 package main
 
+// Generated-By: Claude 4 Sonnet
+
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 	"syscall"
 	"testing"
@@ -749,4 +752,220 @@ func TestSignalHandlingHUP(t *testing.T) {
 	// We can't directly verify they were sent since they're consumed by goroutines,
 	// but we can verify the main effect (reading = false) happened.
 	// This test successfully validates that SIGHUP is handled correctly.
+}
+
+// TestEndToEnd tests the complete pipeline from FIFOs to JSON output
+func TestEndToEnd(t *testing.T) {
+	// Create temporary directory for FIFOs
+	tmpDir, err := os.MkdirTemp("", "script2json-e2e-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	scriptFifoPath := fmt.Sprintf("%s/script.fifo", tmpDir)
+	commandFifoPath := fmt.Sprintf("%s/command.fifo", tmpDir)
+	pidFilePath := fmt.Sprintf("%s/script2json.pid", tmpDir)
+
+	// Create FIFOs
+	if err := syscall.Mkfifo(scriptFifoPath, 0666); err != nil {
+		t.Fatalf("Failed to create script FIFO: %v", err)
+	}
+	if err := syscall.Mkfifo(commandFifoPath, 0666); err != nil {
+		t.Fatalf("Failed to create command FIFO: %v", err)
+	}
+
+	// Redirect stdout to capture JSON output
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	// Reset global state
+	reading.Store(false)
+	recordID.Store(0)
+
+	// Create channels for the pipeline
+	scriptFifoByteChan := make(chan byte, 1024)
+	commandOutputChan := make(chan string, 1)
+	commandChan := make(chan string, 1)
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelError, // Suppress logs during test
+	}))
+
+	// Start the pipeline components
+	go scriptFifoReader(scriptFifoPath, scriptFifoByteChan, logger)
+	go commandFifoReader(commandFifoPath, commandChan, logger)
+	go lineEditor(scriptFifoByteChan, commandOutputChan, logger)
+	go recordCreator(commandOutputChan, commandChan)
+
+	// Write PID file
+	if err := writePidFile(pidFilePath, logger); err != nil {
+		t.Fatalf("Failed to write PID file: %v", err)
+	}
+
+	// Set up signal handling
+	setupSignalHandling(scriptFifoByteChan, pidFilePath, logger)
+
+	// Give goroutines time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Get our PID for sending signals
+	pid := os.Getpid()
+
+	// Test sequence: simulate running "echo hello"
+
+	// 1. Open script FIFO for writing (simulates script -f)
+	scriptFifo, err := os.OpenFile(scriptFifoPath, os.O_WRONLY, 0666)
+	if err != nil {
+		t.Fatalf("Failed to open script FIFO for writing: %v", err)
+	}
+	defer scriptFifo.Close()
+
+	// 2. Send SIGUSR1 to start reading (simulates DEBUG trap)
+	syscall.Kill(pid, syscall.SIGUSR1)
+	time.Sleep(50 * time.Millisecond)
+
+	// 3. Write command output to script FIFO
+	scriptFifo.Write([]byte("hello\r\n"))
+	time.Sleep(50 * time.Millisecond)
+
+	// 4. Write command to command FIFO (PROMPT_COMMAND writes command first)
+	commandFifo, err := os.OpenFile(commandFifoPath, os.O_WRONLY, 0666)
+	if err != nil {
+		t.Fatalf("Failed to open command FIFO for writing: %v", err)
+	}
+	commandFifo.Write([]byte("echo hello\n"))
+	commandFifo.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// 5. Send SIGUSR2 to stop reading and flush (simulates PROMPT_COMMAND)
+	syscall.Kill(pid, syscall.SIGUSR2)
+
+	// Give pipeline time to process
+	time.Sleep(200 * time.Millisecond)
+
+	// Test another command with ANSI sequences: "ls" with colored output
+
+	syscall.Kill(pid, syscall.SIGUSR1)
+	time.Sleep(50 * time.Millisecond)
+
+	// Write output with ANSI color codes (ESC[32m = green)
+	scriptFifo.Write([]byte("\x1b[32mfile.txt\x1b[0m\r\n"))
+	time.Sleep(50 * time.Millisecond)
+
+	// Write command first
+	commandFifo, err = os.OpenFile(commandFifoPath, os.O_WRONLY, 0666)
+	if err != nil {
+		t.Fatalf("Failed to open command FIFO for writing: %v", err)
+	}
+	commandFifo.Write([]byte("ls --color=auto\n"))
+	commandFifo.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Then send SIGUSR2
+	syscall.Kill(pid, syscall.SIGUSR2)
+	time.Sleep(200 * time.Millisecond)
+
+	// Test third command
+
+	syscall.Kill(pid, syscall.SIGUSR1)
+	time.Sleep(50 * time.Millisecond)
+
+	scriptFifo.Write([]byte("fixed\r\n"))
+	time.Sleep(50 * time.Millisecond)
+
+	commandFifo, err = os.OpenFile(commandFifoPath, os.O_WRONLY, 0666)
+	if err != nil {
+		t.Fatalf("Failed to open command FIFO for writing: %v", err)
+	}
+	commandFifo.Write([]byte("echo fixed\n"))
+	commandFifo.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	syscall.Kill(pid, syscall.SIGUSR2)
+	time.Sleep(200 * time.Millisecond)
+
+	// Close stdout and restore
+	w.Close()
+	os.Stdout = oldStdout
+
+	// Read captured output
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+	output := buf.String()
+
+	// Parse JSON lines
+	lines := bytes.Split(buf.Bytes(), []byte("\n"))
+	var records []CommandRecord
+
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		var record CommandRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Logf("Failed to parse JSON line: %s", line)
+			t.Fatalf("JSON parse error: %v", err)
+		}
+		records = append(records, record)
+	}
+
+	// Verify we got 3 records
+	if len(records) < 3 {
+		t.Fatalf("Expected at least 3 records, got %d\nOutput: %s", len(records), output)
+	}
+
+	// Verify first record (echo hello)
+	if records[0].Command != "echo hello" {
+		t.Errorf("Record 0 command = %q, want %q", records[0].Command, "echo hello")
+	}
+	if records[0].Output != "hello\r\n" {
+		t.Errorf("Record 0 output = %q, want %q", records[0].Output, "hello\r\n")
+	}
+
+	// Verify second record (ls --color=auto) - ANSI codes should be stripped
+	if records[1].Command != "ls --color=auto" {
+		t.Errorf("Record 1 command = %q, want %q", records[1].Command, "ls --color=auto")
+	}
+	// The ANSI color codes should be stripped, leaving just "file.txt\r\n"
+	if records[1].Output != "file.txt\r\n" {
+		t.Errorf("Record 1 output = %q, want %q (ANSI codes not stripped)", records[1].Output, "file.txt\r\n")
+	}
+
+	// Verify third record (echo fixed)
+	if records[2].Command != "echo fixed" {
+		t.Errorf("Record 2 command = %q, want %q", records[2].Command, "echo fixed")
+	}
+	if records[2].Output != "fixed\r\n" {
+		t.Errorf("Record 2 output = %q, want %q", records[2].Output, "fixed\r\n")
+	}
+
+	// Verify all records have monotonically increasing IDs
+	for i := 1; i < len(records); i++ {
+		prevID, _ := strconv.Atoi(records[i-1].ID)
+		currID, _ := strconv.Atoi(records[i].ID)
+		if currID <= prevID {
+			t.Errorf("Record IDs not monotonic: %d -> %d", prevID, currID)
+		}
+	}
+
+	// Verify all records have timestamps
+	for i, record := range records {
+		if record.ReturnTimestamp.IsZero() {
+			t.Errorf("Record %d has zero timestamp", i)
+		}
+	}
+
+	// Verify PID file was created and contains correct PID
+	pidData, err := os.ReadFile(pidFilePath)
+	if err != nil {
+		t.Errorf("Failed to read PID file: %v", err)
+	}
+	expectedPID := fmt.Sprintf("%d\n", pid)
+	if string(pidData) != expectedPID {
+		t.Errorf("PID file content = %q, want %q", string(pidData), expectedPID)
+	}
+
+	t.Logf("End-to-end test successful! Processed %d commands", len(records))
 }
