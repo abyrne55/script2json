@@ -13,6 +13,15 @@ The application supports the following command-line flags:
 - `--log-level`: Log level for application output. Valid values: `debug`, `info`, `warn`, `error` (default: `info`)
 - `--pid-file`: Path to write PID file. When specified, the application will write its process ID to this file on startup and automatically clean it up on termination (optional)
 
+## Signals
+
+script2json responds to the following Unix signals:
+
+- `SIGUSR1`: Start reading from script FIFO (enables data processing)
+- `SIGUSR2`: Stop reading and flush current buffer (sends EOF)
+- `SIGHUP`: Reset lineEditor state to recover from desync conditions (clears buffer, cursor, and flags)
+- `SIGINT`/`SIGTERM`: Graceful shutdown with cleanup
+
  ## Usage
 
   1. Build and install the application
@@ -41,3 +50,24 @@ PROMPT_COMMAND='echo "$(fc -ln -1 2>/dev/null | sed "s/^[[:space:]]*//")" > /tmp
 ```
 
 Don't forget to clean up all the FIFOs once you're done
+
+## Recovery from Desync
+
+If commands and outputs become desynchronized (e.g., due to timing issues, race conditions, or stuck state), you can reset script2json without restarting:
+
+```bash
+# Send SIGHUP to reset internal state
+pkill -HUP script2json
+
+# Or if you have the PID file:
+kill -HUP $(cat /path/to/pid.file)
+```
+
+This will:
+- Clear the internal line buffer
+- Reset cursor position
+- Clear alternate screen mode flag
+- Reset CSI parsing state
+- Allow processing to continue fresh
+
+The reset happens safely without interrupting the FIFO connections, so you can continue working immediately.

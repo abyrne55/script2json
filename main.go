@@ -44,6 +44,9 @@ var reading atomic.Bool
 // recordID is a monotonically increasing counter for CommandRecord IDs
 var recordID atomic.Uint64
 
+// resetChan is used to signal a reset of the lineEditor state
+var resetChan = make(chan struct{}, 1)
+
 func main() {
 	scriptFifoPath := flag.String("script-fifo", "/tmp/script.fifo", "Path to the script FIFO to read from")
 	commandFifoPath := flag.String("command-fifo", "/tmp/command.fifo", "Path to the command FIFO to read from")
@@ -162,13 +165,14 @@ func removePidFile(path string, logger *slog.Logger) {
 	}
 }
 
-// setupSignalHandling sets up signal handlers for SIGUSR1, SIGUSR2, and termination signals.
+// setupSignalHandling sets up signal handlers for SIGUSR1, SIGUSR2, SIGHUP, and termination signals.
 // SIGUSR1 starts data processing by setting the reading flag to true.
 // SIGUSR2 stops data processing by setting the reading flag to false and sends EOF to scriptFifoByteChan.
+// SIGHUP resets the lineEditor state to recover from desync conditions.
 // Termination signals (SIGINT, SIGTERM) clean up the PID file and exit gracefully.
 func setupSignalHandling(scriptFifoByteChan chan<- byte, pidFilePath string, logger *slog.Logger) {
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		for sig := range sigs {
@@ -180,6 +184,25 @@ func setupSignalHandling(scriptFifoByteChan chan<- byte, pidFilePath string, log
 				logger.Debug("Received SIGUSR2, stopping data processing")
 				reading.Store(false)
 				scriptFifoByteChan <- EOF
+			case syscall.SIGHUP:
+				logger.Info("Received SIGHUP, resetting lineEditor state")
+				// Stop reading to prevent corrupted data
+				wasReading := reading.Load()
+				reading.Store(false)
+
+				// Send reset signal (non-blocking)
+				select {
+				case resetChan <- struct{}{}:
+				default:
+					// Reset already pending
+				}
+
+				// If we were reading, send EOF to flush current buffer
+				if wasReading {
+					scriptFifoByteChan <- EOF
+				}
+
+				logger.Info("Reset signal sent, lineEditor state will be cleared")
 			case syscall.SIGINT, syscall.SIGTERM:
 				logger.Debug("Received termination signal, cleaning up", "signal", sig)
 				if pidFilePath != "" {
@@ -275,7 +298,7 @@ func commandFifoReader(commandFifoPath string, commandChan chan<- string, logger
 // lineEditor reads bytes from scriptFifoByteChan and processes them into a clean
 // buffer, handling ANSI control sequences for cursor movement, backspace, and
 // alternate screen mode. When it receives an EOF, it sends the cleaned buffer
-// as a string to the commandOutputChan.
+// as a string to the commandOutputChan. Can be reset via resetChan to recover from desync.
 func lineEditor(scriptFifoByteChan <-chan byte, commandOutputChan chan<- string, logger *slog.Logger) {
 	var buffer []byte
 	var mu sync.Mutex
@@ -283,6 +306,18 @@ func lineEditor(scriptFifoByteChan <-chan byte, commandOutputChan chan<- string,
 	cursor := 0
 	inCSI := false
 	inAlternateScreen := false
+
+	// resetState clears all lineEditor state
+	resetState := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		buffer = nil
+		csiBuffer = nil
+		cursor = 0
+		inCSI = false
+		inAlternateScreen = false
+		logger.Debug("lineEditor state reset", "buffer_cleared", true)
+	}
 
 	// Start debug logging goroutine if debug level is enabled
 	go func() {
@@ -295,6 +330,13 @@ func lineEditor(scriptFifoByteChan <-chan byte, commandOutputChan chan<- string,
 			mu.Unlock()
 
 			logger.Debug("lineEditor buffer state", "buffer", string(bufCopy), "cursor", cursor)
+		}
+	}()
+
+	// Start goroutine to monitor for reset signals
+	go func() {
+		for range resetChan {
+			resetState()
 		}
 	}()
 
